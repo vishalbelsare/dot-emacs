@@ -8765,37 +8765,50 @@ Works on the current heading, or all headings in the active region."
 *** my-rocketchat-insert-message-from-url
 
 | 2025-10-20 | initial version via Sonnet 4.5 |
+| 2026-05-20 | extended version that adds an emoticon reaction overview table |
+
+Example: 
+
+1. You get the URL of a message from Rocket.Chat from the message context menu ("Copy Link") into your clipboard.
+2. You invoke =my-dwim-insert-stuff=, e.g., via your keyboard binding
+   - My code should determine that the content of the clipboard is
+     actually a Rocket.Chat message. Please check the detection
+     mechanism yourself and adapt accordingly.
+3. The message gets inserts into your Orgdown file.
+
+Example output:
+
+- [2024-09-23 Mon 10:27] [[https://example.com/direct/669a6b9f797abcf37561c?msg=i8pP7ER123456y][Message from karl.voit]]:
+  Hi [cite/t:@all], lets find some time to talk.
+  
+  Please do react accordingly and the winning spot will be sent out by me.
+  
+  :one: Fr 27. 10-12
+  :two: Fr 27. 11-13
+  :three: Fr 27. 12-14
+  :four: Fr 27. 13-15
+  :five: Fr 27. 14-16
+  :six: Mo 30. 10-12
+  :seven: Mo 30. 17-19
+  :thumbdown: Keine Option passend.
+
+  | :one: Fr 27. 10-12                | 1 | █     | @karl.voit                                                                            |
+  | :two: Fr 27. 11-13                | 1 | █     | @karl.voit                                                                            |
+  | :three: Fr 27. 12-14              | 2 | ██    | @karl.voit @martin.griesbacher                                                        |
+  | :four: Fr 27. 13-15               | 2 | ██    | @karl.voit @philipp.habinger                                                          |
+  | :five: Fr 27. 14-16               | 2 | ██    | @karl.voit @florian.fankhauser                                                        |
+  | *:six: Mo 30. 10-12*              | 5 | █████ | @karl.voit @martin.griesbacher @thiago.carneiro @florian.fankhauser @philipp.habinger |
+  | :seven: Mo 30. 17-19              | 3 | ███   | @karl.voit @wolfgang.leitner @philipp.habinger                                        |
+  | :thumbdown: Keine Option passend. | 0 |       |                                                                                       |
+  | :thumbsdown:                      | 1 | █     | @oskar.malnowicz                                                                      |
+  #+TBLFM: $3='(orgtbl-uc-draw-cont $2 0 5 5)
+
+(Yes, there is at least one Rocket.Chat add-on that add survey functionality but its UX is much worse than our workaround here.)
 
 #+BEGIN_SRC emacs-lisp
 ;;; -*- lexical-binding: t; -*-
 
-;(require 'request)
 (require 'json)
-
-;; Following variables are defined in a private section of this configuration:
-
-;; (defvar rocketchat-server-url "https://example.com"
-;;   "URL of your Rocket.Chat server")
-;; 
-;; (defvar rocketchat-user-id "foo"
-;;   "Your Rocket.Chat user ID")
-;; 
-;; ;; Profile → Personal Access Tokens
-;; (defvar rocketchat-auth-token "bar"
-;;   "Your Rocket.Chat authentication token")
-
-(defun rocketchat-markdown-to-org (markdown-text)
-  "Convert MARKDOWN-TEXT to Org-mode format using pandoc."
-  (with-temp-buffer
-    (insert markdown-text)
-    (if (zerop (shell-command-on-region (point-min) (point-max)
-                                        "pandoc -f markdown -t org"
-                                        t t))
-        (buffer-string)
-      ;; If pandoc fails, return original text
-      (progn
-        (message "Warning: pandoc conversion failed, using original text")
-        markdown-text))))
 
 (defun rocketchat-markdown-to-org (markdown-text)
   "Convert MARKDOWN-TEXT to Org-mode format using pandoc."
@@ -8814,6 +8827,87 @@ Works on the current heading, or all headings in the active region."
         (message "Warning: pandoc conversion failed, using original text")
         markdown-text))))
 
+(defun rocketchat-is-survey-message (msg-text)
+  "Check if MSG-TEXT contains a survey (consecutive :one: and :two: lines)."
+  (string-match-p ":one:.*\n.*:two:" msg-text))
+
+(defun rocketchat-extract-survey-options (msg-text)
+  "Extract survey options from MSG-TEXT. Returns list of (emoji . description)."
+  (let ((options '())
+        (lines (split-string msg-text "\n")))
+    (dolist (line lines)
+      (when (string-match "^[ \t]*\\(:[a-z_]+:\\)[ \t]+\\(.*\\)$" line)
+        (push (cons (match-string 1 line) (string-trim (match-string 2 line))) options)))
+    (nreverse options)))
+
+(defun rocketchat-normalize-emoji (emoji)
+  "Normalize EMOJI to :name: format from symbol."
+  (if (symbolp emoji)
+      (let ((name (symbol-name emoji)))
+        ;; Symbol name is already like :one: - just convert to string
+        (if (string-prefix-p ":" name)
+            name
+          (concat ":" name ":")))
+    emoji))
+
+(defun rocketchat-count-reactions (reactions)
+  "Count reactions by emoji. REACTIONS is the reactions field from message data.
+Returns alist of (emoji . (count . usernames))."
+  (let ((result '()))
+    (when reactions
+      (mapc (lambda (reaction)
+              (let* ((emoji-symbol (car reaction))
+                     (emoji (rocketchat-normalize-emoji emoji-symbol))
+                     (data (cdr reaction))
+                     (usernames-vec (cdr (assoc 'usernames data)))
+                     (usernames (append usernames-vec nil)))  ; Convert vector to list
+                (push (cons emoji (cons (length usernames) usernames)) result)))
+            reactions))
+    (nreverse result)))
+
+(defun rocketchat-format-reaction-table (survey-options reactions)
+  "Format reaction results as Org-mode table.
+SURVEY-OPTIONS is list of (emoji . description) for survey messages, or nil for regular messages.
+REACTIONS is the reactions field from message data."
+  (let* ((reaction-data (rocketchat-count-reactions reactions))
+         (all-survey-emojis (mapcar #'car survey-options))
+         (all-reaction-emojis (mapcar #'car reaction-data))
+         ;; Combine: survey emojis first (in order), then additional reactions not in survey
+         (additional-emojis (seq-difference all-reaction-emojis all-survey-emojis))
+         (all-emojis (append all-survey-emojis additional-emojis))
+         (max-count (apply #'max 0 (mapcar (lambda (rd) (cadr rd)) reaction-data)))
+         (rows '()))
+    
+    ;; Build rows
+    (dolist (emoji all-emojis)
+      (let* ((desc (cdr (assoc emoji survey-options)))
+             (reaction-info (assoc emoji reaction-data))
+             (count (if reaction-info (cadr reaction-info) 0))
+             (usernames (if reaction-info (cddr reaction-info) '()))
+             (label (if desc 
+                       (format "%s %s" emoji desc)
+                     emoji))
+             (label-formatted (if (and (> max-count 0) (= count max-count))
+                                 (format "*%s*" label)
+                               label))
+             (users-str (if usernames
+                           (mapconcat (lambda (u) (format "@%s" u)) 
+                                    usernames " ")
+                         "")))
+        (push (list label-formatted count "" users-str) rows)))
+    
+    (setq rows (nreverse rows))
+    
+    ;; Format as Org table with empty line before
+    (with-temp-buffer
+      (insert "\n\n")  ; Empty line before table
+      (dolist (row rows)
+        (insert (format "  | %s | %d | %s | %s |\n"
+                       (nth 0 row) (nth 1 row) (nth 2 row) (nth 3 row))))
+      (insert (format "  #+TBLFM: $3='(orgtbl-uc-draw-cont $2 0 %d %d)\n" 
+                     max-count max-count))
+      (buffer-string))))
+
 (defun rocketchat-message-to-org (message-data)
   "Convert Rocket.Chat MESSAGE-DATA to Org-mode format."
   (condition-case err
@@ -8823,6 +8917,7 @@ Works on the current heading, or all headings in the active region."
              (timestamp (cdr (assoc 'ts message)))
              (msg-id (cdr (assoc '_id message)))
              (room-id (cdr (assoc 'rid message)))
+             (reactions (cdr (assoc 'reactions message)))
              ;; Construct the message URL
              (msg-url (format "%s/direct/%s?msg=%s" 
                              rocketchat-server-url 
@@ -8832,13 +8927,25 @@ Works on the current heading, or all headings in the active region."
              (parsed-time (parse-iso8601-time-string timestamp))
              (org-timestamp (format-time-string "[%Y-%m-%d %a %H:%M]" parsed-time))
              ;; Convert markdown to org-mode
-             (org-text (rocketchat-markdown-to-org msg-text)))
-        (format "- %s [[%s][Message from %s]]:\n  %s\n"
+             (org-text (rocketchat-markdown-to-org msg-text))
+             ;; Check if this is a survey message
+             (is-survey (rocketchat-is-survey-message msg-text))
+             ;; Generate reaction table if there are any reactions
+             (reaction-table (when reactions
+                              (let ((options (if is-survey
+                                               (rocketchat-extract-survey-options msg-text)
+                                             nil)))
+                                (rocketchat-format-reaction-table options reactions)))))
+        (format "- %s [[%s][Message from %s]]:\n  %s%s\n"
                 org-timestamp
                 msg-url
                 username
                 ;; Indent each line of the converted text by 2 spaces
-                (replace-regexp-in-string "\n" "\n  " (string-trim org-text))))
+                (replace-regexp-in-string "\n" "\n  " (string-trim org-text))
+                ;; Add reaction table if there are reactions (already has empty line prefix)
+                (if reaction-table
+                    reaction-table
+                  "")))
     (error
      (message "Error formatting message: %S" err)
      (format "- Error formatting message\n  %S\n" message-data))))
@@ -8846,7 +8953,6 @@ Works on the current heading, or all headings in the active region."
 ;; Fetch a specific message by ID and insert it
 (defun rocketchat-insert-message (message-id)
   "Fetch Rocket.Chat message by MESSAGE-ID and insert as Org-mode content."
-;;  (interactive "sMessage ID: ")
   (request
     (concat rocketchat-server-url "/api/v1/chat.getMessage")
     :type "GET"
@@ -11195,10 +11301,11 @@ Do *not* use =org-link-abbrev-alist= for defining links that are handled via fun
           ("SMS" . ,(concat my-business-jira-server "/browse/SMS-%s"))
           ("SDSIEMOC" . ,(concat my-business-jira-server "/browse/SDSIEMOC-%s"))
           ("VTLOGMON" . ,(concat my-business-jira-server "/browse/VTLOGMON-%s"))
-          ("TP" . ,(concat my-business-sd-server "/browse/TP-%s"))
+          ("TP" . ,(concat my-business-jira-server "/browse/TP-%s"))
           ("PRZ" . ,(concat my-business-jira-server "/browse/PRZ-%s"))
           ("POPP" . ,(concat my-business-jira-server "/browse/POPPANF-%s"))
           ("POPPANF" . ,(concat my-business-jira-server "/browse/POPPANF-%s"))
+          ("SK" . ,(concat my-business-sd-server "/secure/insight/assets/SK-%s"))
           ))
 #+END_SRC
 
